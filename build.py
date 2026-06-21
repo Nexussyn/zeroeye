@@ -67,3 +67,27 @@ def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SI
 
     logd_path.unlink()
     return chunks
+
+
+def clean_module(module_path: Path, commands: list[list[str]]) -> list[str]:
+    """Run clean commands for a module and return a list of failed command descriptions."""
+    failed_commands: list[str] = []
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(module_path),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                cmd_str = " ".join(cmd)
+                failed_commands.append(f"{module_path.name}: {cmd_str} (exit {result.returncode})")
+        except subprocess.TimeoutExpired:
+            cmd_str = " ".join(cmd)
+            failed_commands.append(f"{module_path.name}: {cmd_str} (timeout)")
+        except Exception as e:
+            cmd_str = " ".join(cmd)
+            failed_commands.append(f"{module_path.name}: {cmd_str} (error: {e})")
+    return failed_commands
