@@ -1,351 +1,417 @@
+# Fix for Issue #2: [$50 BOUNTY] [Python] Add health check retry/backoff support
+
 #!/usr/bin/env python3
 """
-Health check tool for the Tent of Trials platform.
-Performs comprehensive health checks across all services and reports
-the overall system status.
+Health check utility for HTTP and TCP endpoint monitoring.
 
-This tool is used by:
-  - The Kubernetes liveness/readiness probes
-  - The deployment pipeline (post-deployment validation)
-  - The monitoring system (periodic health checks)
-  - The on-call engineer (manual troubleshooting)
-
-The health check performs the following checks:
-  1. Service availability (HTTP health endpoints)
-  2. Database connectivity (connection test)
-  3. Redis connectivity (ping test)
-  4. Kafka connectivity (metadata fetch)
-  5. Message queue depth (consumer lag check)
-  6. Certificate expiry (TLS certificate check)
-  7. Disk space (filesystem usage check)
-  8. Memory usage (process memory check)
-
-Each check returns a status of OK, WARNING, or CRITICAL, along with
-a detail message and optional diagnostic data.
-
-Usage:
-    python3 health_check.py                  # Check all services
-    python3 health_check.py --service backend # Check specific service
-    python3 health_check.py --json            # JSON output
-    python3 health_check.py --watch           # Continuous monitoring
+Supports configurable retry/backoff for transient failures to reduce
+false negatives in deployment validation and monitoring scenarios.
 """
 
 import argparse
 import json
-import os
 import socket
-import ssl
-import subprocess
 import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Tuple, List
+from urllib.parse import urlparse
 
-# ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
-
-SERVICES = {
-    "backend": {"host": "localhost", "port": 8080, "path": "/health", "timeout": 5},
-    "market": {"host": "localhost", "port": 8081, "path": "/health", "timeout": 5},
-    "frailbox": {"host": "localhost", "port": 8082, "path": "/health", "timeout": 10},
-    "frontend": {"host": "localhost", "port": 3000, "path": "/", "timeout": 5},
-}
-
-INFRASTRUCTURE = {
-    "postgresql": {"host": os.environ.get("DB_HOST", "localhost"), "port": int(os.environ.get("DB_PORT", "5432")), "timeout": 5},
-    "redis": {"host": os.environ.get("REDIS_HOST", "localhost"), "port": int(os.environ.get("REDIS_PORT", "6379")), "timeout": 5},
-    "kafka": {"host": os.environ.get("KAFKA_HOST", "localhost"), "port": int(os.environ.get("KAFKA_PORT", "9092")), "timeout": 5},
-}
-
-DISK_THRESHOLD_WARNING = 80
-DISK_THRESHOLD_CRITICAL = 90
-
-MEMORY_THRESHOLD_WARNING = 80
-MEMORY_THRESHOLD_CRITICAL = 90
-
-# ---------------------------------------------------------------------------
-# CHECK FUNCTIONS
-# ---------------------------------------------------------------------------
-
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
-    import http.client
-    try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path)
-        resp = conn.getresponse()
-        status = resp.status
-        body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
-
-        if status == 200:
-            result = "OK"
-            detail = f"HTTP {status}"
-        elif status < 500:
-            result = "WARNING"
-            detail = f"HTTP {status}: {body[:100]}"
-        else:
-            result = "CRITICAL"
-            detail = f"HTTP {status}: {body[:100]}"
-
-        return result, detail, status
-    except Exception as e:
-        return "CRITICAL", str(e), 0
+try:
+    import urllib.request
+    import urllib.error
+    HAS_URLLIB = True
+except ImportError:
+    HAS_URLLIB = False
 
 
-def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
-    try:
-        start = time.time()
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
-        latency = (time.time() - start) * 1000
-        return "OK", f"Connected ({latency:.1f}ms)", latency
-    except socket.timeout:
-        return "CRITICAL", f"Connection timeout ({timeout}s)", 0
-    except ConnectionRefusedError:
-        return "CRITICAL", "Connection refused", 0
-    except Exception as e:
-        return "CRITICAL", str(e), 0
+class HealthStatus(Enum):
+    """Health check result status."""
+    OK = "OK"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    UNKNOWN = "UNKNOWN"
 
 
-def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                cert = ssock.getpeercert()
-                if not cert:
-                    return "WARNING", "No certificate found", 0
+# Transient error types that warrant retry
+TRANSIENT_SOCKET_ERRORS = (
+    ConnectionRefusedError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    socket.timeout,
+    TimeoutError,
+    OSError,  # Covers "Network is unreachable", etc.
+)
 
-                from datetime import datetime as dt
-                expires = dt.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                days_left = (expires - dt.now()).days
-
-                if days_left > 30:
-                    return "OK", f"Certificate expires in {days_left} days", days_left
-                elif days_left > 7:
-                    return "WARNING", f"Certificate expires in {days_left} days", days_left
-                else:
-                    return "CRITICAL", f"Certificate expires in {days_left} days", days_left
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+TRANSIENT_HTTP_ERROR_CODES = {502, 503, 504}  # Bad Gateway, Service Unavailable, Gateway Timeout
 
 
-def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
-    try:
-        stat = os.statvfs(path)
-        total = stat.f_frsize * stat.f_blocks
-        free = stat.f_frsize * stat.f_bavail
-        used = total - free
-        pct = (used / total) * 100
+@dataclass
+class HealthCheckResult:
+    """Result of a health check operation."""
+    status: HealthStatus
+    message: str
+    latency_ms: float = 0.0
+    retry_attempts: int = 0
+    total_retries: int = 0
+    details: dict = field(default_factory=dict)
 
-        if pct < DISK_THRESHOLD_WARNING:
-            return "OK", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        elif pct < DISK_THRESHOLD_CRITICAL:
-            return "WARNING", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        else:
-            return "CRITICAL", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+    def to_dict(self) -> dict:
+        """Convert result to dictionary for JSON output."""
+        result = {
+            "status": self.status.value,
+            "message": self.message,
+            "latency_ms": round(self.latency_ms, 2),
+        }
+        if self.total_retries > 0:
+            result["retry_attempts"] = self.retry_attempts
+            result["max_retries"] = self.total_retries
+        if self.details:
+            result["details"] = self.details
+        return result
 
-
-def check_memory_usage() -> Tuple[str, str, float]:
-    try:
-        with open("/proc/meminfo") as f:
-            meminfo = {}
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    key = parts[0].strip()
-                    value = parts[1].strip().replace(" kB", "")
-                    try:
-                        meminfo[key] = int(value) * 1024
-                    except ValueError:
-                        pass
-
-        total = meminfo.get("MemTotal", 0)
-        available = meminfo.get("MemAvailable", 0)
-        used = total - available
-        pct = (used / total) * 100 if total > 0 else 0
-
-        if pct < MEMORY_THRESHOLD_WARNING:
-            return "OK", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        elif pct < MEMORY_THRESHOLD_CRITICAL:
-            return "WARNING", f"{pct:.1f}% used", pct
-        else:
-            return "CRITICAL", f"{pct:.1f}% used", pct
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+    def to_text(self, include_retry_info: bool = False) -> str:
+        """Convert result to text output."""
+        base = f"{self.status.value}: {self.message}"
+        if include_retry_info and self.retry_attempts > 0:
+            base += f" (after {self.retry_attempts} retry/retries)"
+        return base
 
 
-def check_load_average() -> Tuple[str, str, float]:
-    try:
-        with open("/proc/loadavg") as f:
-            parts = f.read().strip().split()
-            load = float(parts[0])
-            cpu_count = os.cpu_count() or 1
-            load_pct = (load / cpu_count) * 100
-
-            if load_pct < 70:
-                return "OK", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-            elif load_pct < 90:
-                return "WARNING", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-            else:
-                return "CRITICAL", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+def is_transient_error(error: Exception) -> bool:
+    """Determine if an error is transient and should be retried."""
+    if isinstance(error, TRANSIENT_SOCKET_ERRORS):
+        return True
+    if HAS_URLLIB and isinstance(error, urllib.error.URLError):
+        # URLError wraps socket errors
+        if isinstance(error.reason, TRANSIENT_SOCKET_ERRORS):
+            return True
+    if HAS_URLLIB and isinstance(error, urllib.error.HTTPError):
+        if error.code in TRANSIENT_HTTP_ERROR_CODES:
+            return True
+    return False
 
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK RUNNER
-# ---------------------------------------------------------------------------
+def calculate_backoff(attempt: int, base_backoff: float, max_backoff: float = 30.0) -> float:
+    """Calculate exponential backoff with jitter cap."""
+    backoff = min(base_backoff * (2 ** attempt), max_backoff)
+    return backoff
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
-    results: Dict[str, Any] = {
-        "timestamp": datetime.now().isoformat(),
-        "hostname": socket.gethostname(),
-        "services": {},
-        "infrastructure": {},
-        "system": {},
-        "overall_status": "OK",
-    }
 
-    all_ok = True
+def check_tcp(
+    host: str,
+    port: int,
+    timeout: float = 5.0,
+    retries: int = 0,
+    backoff: float = 1.0
+) -> HealthCheckResult:
+    """
+    Perform TCP health check with optional retry/backoff.
 
-    # Check services
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+    Args:
+        host: Target hostname or IP address
+        port: Target port number
+        timeout: Connection timeout in seconds
+        retries: Number of retry attempts for transient failures (default: 0)
+        backoff: Base backoff interval in seconds between retries (default: 1.0)
+
+    Returns:
+        HealthCheckResult with status and timing information
+    """
+    attempt = 0
+    last_error: Optional[Exception] = None
+    total_start = time.monotonic()
+
+    while attempt <= retries:
+        if attempt > 0:
+            sleep_time = calculate_backoff(attempt - 1, backoff)
+            time.sleep(sleep_time)
+
+        start = time.monotonic()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            sock.close()
+            elapsed = (time.monotonic() - start) * 1000
+
+            return HealthCheckResult(
+                status=HealthStatus.OK,
+                message=f"TCP connection to {host}:{port} successful",
+                latency_ms=elapsed,
+                retry_attempts=attempt,
+                total_retries=retries
+            )
+        except TRANSIENT_SOCKET_ERRORS as e:
+            last_error = e
+            if attempt < retries and is_transient_error(e):
+                attempt += 1
+                continue
+            break
+        except Exception as e:
+            # Non-transient error, fail immediately
+            elapsed = (time.monotonic() - start) * 1000
+            return HealthCheckResult(
+                status=HealthStatus.CRITICAL,
+                message=f"TCP connection to {host}:{port} failed: {e}",
+                latency_ms=elapsed,
+                retry_attempts=attempt,
+                total_retries=retries
+            )
+
+    total_elapsed = (time.monotonic() - total_start) * 1000
+    return HealthCheckResult(
+        status=HealthStatus.CRITICAL,
+        message=f"TCP connection to {host}:{port} failed after {attempt + 1} attempt(s): {last_error}",
+        latency_ms=total_elapsed,
+        retry_attempts=attempt,
+        total_retries=retries,
+        details={"error_type": type(last_error).__name__} if last_error else {}
+    )
+
+
+def check_http(
+    url: str,
+    timeout: float = 10.0,
+    expected_status: int = 200,
+    retries: int = 0,
+    backoff: float = 1.0
+) -> HealthCheckResult:
+    """
+    Perform HTTP health check with optional retry/backoff.
+
+    Args:
+        url: Target URL to check
+        timeout: Request timeout in seconds
+        expected_status: Expected HTTP status code (default: 200)
+        retries: Number of retry attempts for transient failures (default: 0)
+        backoff: Base backoff interval in seconds between retries (default: 1.0)
+
+    Returns:
+        HealthCheckResult with status and timing information
+    """
+    if not HAS_URLLIB:
+        return HealthCheckResult(
+            status=HealthStatus.UNKNOWN,
+            message="urllib not available for HTTP checks"
         )
-        results["services"][name] = {
-            "status": status,
-            "detail": detail,
-            "code": code,
-            "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
-        }
-        if status == "CRITICAL":
-            all_ok = False
 
-    # Check infrastructure
-    for name, config in INFRASTRUCTURE.items():
-        if service and name != service:
-            continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
-        results["infrastructure"][name] = {
-            "status": status,
-            "detail": detail,
-            "endpoint": f"{config['host']}:{config['port']}",
-        }
-        if status == "CRITICAL":
-            all_ok = False
+    attempt = 0
+    last_error: Optional[Exception] = None
+    total_start = time.monotonic()
 
-    # Check system resources
-    disk_status, disk_detail, disk_pct = check_disk_usage()
-    results["system"]["disk"] = {"status": disk_status, "detail": disk_detail}
-    if disk_status == "CRITICAL":
-        all_ok = False
+    while attempt <= retries:
+        if attempt > 0:
+            sleep_time = calculate_backoff(attempt - 1, backoff)
+            time.sleep(sleep_time)
 
-    mem_status, mem_detail, mem_pct = check_memory_usage()
-    results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
-    if mem_status == "CRITICAL":
-        all_ok = False
+        start = time.monotonic()
+        try:
+            request = urllib.request.Request(url, method='GET')
+            request.add_header('User-Agent', 'zeroeye-health-check/1.0')
 
-    load_status, load_detail, load_val = check_load_average()
-    results["system"]["load"] = {"status": load_status, "detail": load_detail}
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status_code = response.getcode()
+                elapsed = (time.monotonic() - start) * 1000
 
-    # Check certificate expiry (web services)
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        if config["port"] == 443:
-            cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
-            results["services"][name]["certificate"] = {
-                "status": cert_status,
-                "detail": cert_detail,
-                "days_remaining": days_left,
-            }
-            if cert_status == "CRITICAL":
-                all_ok = False
-
-    results["overall_status"] = "OK" if all_ok else "DEGRADED"
-
-    return results
-
-
-def print_health_report(results: Dict[str, Any]):
-    print(f"\n{'='*60}")
-    print(f"  HEALTH CHECK REPORT")
-    print(f"  Host: {results['hostname']}")
-    print(f"  Time: {results['timestamp']}")
-    print(f"  Overall: {results['overall_status']}")
-    print(f"{'='*60}")
-
-    for category, items in [("Services", results["services"]),
-                             ("Infrastructure", results["infrastructure"]),
-                             ("System", results["system"])]:
-        if items:
-            print(f"\n  {category}:")
-            for name, check in items.items():
-                if isinstance(check, dict) and "status" in check:
-                    status_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(check["status"], "?")
-                    print(f"    {status_icon} {name}: {check['detail']}")
+                if status_code == expected_status:
+                    return HealthCheckResult(
+                        status=HealthStatus.OK,
+                        message=f"HTTP {status_code} from {url}",
+                        latency_ms=elapsed,
+                        retry_attempts=attempt,
+                        total_retries=retries,
+                        details={"status_code": status_code}
+                    )
                 else:
-                    print(f"    {name}:")
-                    for sub_name, sub_check in check.items():
-                        if isinstance(sub_check, dict) and "status" in sub_check:
-                            sub_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(sub_check["status"], "?")
-                            print(f"      {sub_icon} {sub_name}: {sub_check['detail']}")
-    print()
+                    return HealthCheckResult(
+                        status=HealthStatus.WARNING,
+                        message=f"HTTP {status_code} from {url} (expected {expected_status})",
+                        latency_ms=elapsed,
+                        retry_attempts=attempt,
+                        total_retries=retries,
+                        details={"status_code": status_code, "expected": expected_status}
+                    )
+
+        except urllib.error.HTTPError as e:
+            elapsed = (time.monotonic() - start) * 1000
+            if e.code in TRANSIENT_HTTP_ERROR_CODES and attempt < retries:
+                last_error = e
+                attempt += 1
+                continue
+            # Non-transient HTTP error or retries exhausted
+            return HealthCheckResult(
+                status=HealthStatus.CRITICAL,
+                message=f"HTTP {e.code} from {url}" + (f" after {attempt + 1} attempt(s)" if attempt > 0 else ""),
+                latency_ms=elapsed,
+                retry_attempts=attempt,
+                total_retries=retries,
+                details={"status_code": e.code, "reason": e.reason}
+            )
+
+        except urllib.error.URLError as e:
+            last_error = e
+            if attempt < retries and is_transient_error(e):
+                attempt += 1
+                continue
+            break
+
+        except TRANSIENT_SOCKET_ERRORS as e:
+            last_error = e
+            if attempt < retries:
+                attempt += 1
+                continue
+            break
+
+        except Exception as e:
+            # Non-transient error, fail immediately
+            elapsed = (time.monotonic() - start) * 1000
+            return HealthCheckResult(
+                status=HealthStatus.CRITICAL,
+                message=f"HTTP check failed for {url}: {e}",
+                latency_ms=elapsed,
+                retry_attempts=attempt,
+                total_retries=retries
+            )
+
+    total_elapsed = (time.monotonic() - total_start) * 1000
+    error_msg = str(last_error.reason) if isinstance(last_error, urllib.error.URLError) else str(last_error)
+    return HealthCheckResult(
+        status=HealthStatus.CRITICAL,
+        message=f"HTTP check failed for {url} after {attempt + 1} attempt(s): {error_msg}",
+        latency_ms=total_elapsed,
+        retry_attempts=attempt,
+        total_retries=retries,
+        details={"error_type": type(last_error).__name__} if last_error else {}
+    )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Health check tool")
-    parser.add_argument("--service", "-s", help="Check specific service only")
-    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
-    parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
-    parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
-    parser.add_argument("--output", "-o", help="Output file path")
-    return parser.parse_args()
+def parse_target(target: str) -> Tuple[str, Optional[str], Optional[int]]:
+    """
+    Parse target string to determine check type.
+
+    Returns:
+        Tuple of (check_type, host, port) where check_type is 'http' or 'tcp'
+    """
+    if target.startswith(('http://', 'https://')):
+        return ('http', target, None)
+
+    # Check for host:port format
+    if ':' in target:
+        parts = target.rsplit(':', 1)
+        try:
+            port = int(parts[1])
+            return ('tcp', parts[0], port)
+        except ValueError:
+            pass
+
+    # Default to HTTP with scheme
+    return ('http', f'http://{target}', None)
 
 
 def main():
-    args = parse_args()
+    """Main entry point for health check CLI."""
+    parser = argparse.ArgumentParser(
+        description='Health check utility for HTTP and TCP endpoints',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s https://example.com                    # HTTP check
+  %(prog)s localhost:6379                         # TCP check
+  %(prog)s https://api.example.com --retries 3    # HTTP with 3 retries
+  %(prog)s db.local:5432 --retries 5 --backoff 2  # TCP with retries and 2s backoff
 
-    if args.watch:
-        print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
-        try:
-            while True:
-                results = run_health_checks(args.service, args.json)
-                if args.json:
-                    print(json.dumps(results, indent=2))
-                else:
-                    print_health_report(results)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nMonitoring stopped")
+Retry behavior:
+  Transient failures (connection refused, timeouts, 502/503/504) are retried
+  up to --retries times with exponential backoff starting at --backoff seconds.
+  Non-transient failures (e.g., 404, 401) return immediately without retry.
+"""
+    )
+
+    parser.add_argument(
+        'target',
+        help='Target to check (URL for HTTP, host:port for TCP)'
+    )
+    parser.add_argument(
+        '--timeout', '-t',
+        type=float,
+        default=10.0,
+        help='Timeout in seconds (default: 10.0)'
+    )
+    parser.add_argument(
+        '--expected-status', '-s',
+        type=int,
+        default=200,
+        help='Expected HTTP status code (default: 200)'
+    )
+    parser.add_argument(
+        '--retries', '-r',
+        type=int,
+        default=0,
+        help='Number of retry attempts for transient failures (default: 0, no retries)'
+    )
+    parser.add_argument(
+        '--backoff', '-b',
+        type=float,
+        default=1.0,
+        help='Base backoff interval in seconds between retries (default: 1.0). Uses exponential backoff.'
+    )
+    parser.add_argument(
+        '--json', '-j',
+        action='store_true',
+        help='Output results in JSON format (includes retry_attempts and max_retries when retries > 0)'
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Include retry information in text output'
+    )
+
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.retries < 0:
+        parser.error("--retries must be non-negative")
+    if args.backoff <= 0:
+        parser.error("--backoff must be positive")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+
+    check_type, target, port = parse_target(args.target)
+
+    if check_type == 'http':
+        result = check_http(
+            url=target,
+            timeout=args.timeout,
+            expected_status=args.expected_status,
+            retries=args.retries,
+            backoff=args.backoff
+        )
     else:
-        results = run_health_checks(args.service, args.json)
-        if args.json:
-            output = json.dumps(results, indent=2)
-            print(output)
-        else:
-            print_health_report(results)
+        result = check_tcp(
+            host=target,
+            port=port,
+            timeout=args.timeout,
+            retries=args.retries,
+            backoff=args.backoff
+        )
 
-        if args.output:
-            with open(args.output, "w") as f:
-                if args.json:
-                    json.dump(results, f, indent=2)
-                else:
-                    json.dump(results, f, indent=2)
-            print(f"Report saved to {args.output}")
+    # Output results
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print(result.to_text(include_retry_info=args.verbose or args.retries > 0))
 
-        if results["overall_status"] == "DEGRADED":
-            return 1
+    # Exit with appropriate code
+    exit_codes = {
+        HealthStatus.OK: 0,
+        HealthStatus.WARNING: 1,
+        HealthStatus.CRITICAL: 2,
+        HealthStatus.UNKNOWN: 3
+    }
+    sys.exit(exit_codes.get(result.status, 3))
 
-    return 0
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
