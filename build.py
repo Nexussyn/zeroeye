@@ -89,5 +89,58 @@ def clean_module(module_path: Path, commands: list[list[str]]) -> list[str]:
             failed_commands.append(f"{module_path.name}: {cmd_str} (timeout)")
         except Exception as e:
             cmd_str = " ".join(cmd)
-            failed_commands.append(f"{module_path.name}: {cmd_str} (error: {e})")
+            failed_commands.append(f"{module_path.name}: {cmd_str} ({e})")
     return failed_commands
+
+
+def clean_all() -> int:
+    """Clean all build artifacts from all modules."""
+    all_failed: list[str] = []
+
+    # Clean Gradle modules
+    gradle_modules = [
+        ROOT / "android",
+    ]
+    for module in gradle_modules:
+        if module.exists():
+            all_failed.extend(clean_module(module, [["./gradlew", "clean"]]))
+
+    # Clean Cargo modules
+    cargo_modules = [
+        ROOT / "core",
+    ]
+    for module in cargo_modules:
+        if module.exists():
+            all_failed.extend(clean_module(module, [["cargo", "clean"]]))
+
+    # Clean diagnostic directory
+    if DIAGNOSTIC_DIR.exists():
+        try:
+            shutil.rmtree(DIAGNOSTIC_DIR)
+        except Exception as e:
+            all_failed.append(f"diagnostic: rmtree ({e})")
+
+    if all_failed:
+        print("Clean completed with errors:")
+        for failure in all_failed:
+            print(f"  - {failure}")
+        return 1
+    else:
+        print("Clean completed successfully.")
+        return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="ZeroEye build script")
+    parser.add_argument("--clean", action="store_true", help="Clean all build artifacts")
+    args = parser.parse_args()
+
+    if args.clean:
+        return clean_all()
+
+    print("Build not yet implemented.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
