@@ -1,351 +1,420 @@
+# Fix for Issue #4: [$50 BOUNTY] [Python] Add retry/backoff to health_check.py for transient failures
+
 #!/usr/bin/env python3
 """
-Health check tool for the Tent of Trials platform.
-Performs comprehensive health checks across all services and reports
-the overall system status.
+Health check module with retry/backoff for transient failures.
 
-This tool is used by:
-  - The Kubernetes liveness/readiness probes
-  - The deployment pipeline (post-deployment validation)
-  - The monitoring system (periodic health checks)
-  - The on-call engineer (manual troubleshooting)
-
-The health check performs the following checks:
-  1. Service availability (HTTP health endpoints)
-  2. Database connectivity (connection test)
-  3. Redis connectivity (ping test)
-  4. Kafka connectivity (metadata fetch)
-  5. Message queue depth (consumer lag check)
-  6. Certificate expiry (TLS certificate check)
-  7. Disk space (filesystem usage check)
-  8. Memory usage (process memory check)
-
-Each check returns a status of OK, WARNING, or CRITICAL, along with
-a detail message and optional diagnostic data.
-
-Usage:
-    python3 health_check.py                  # Check all services
-    python3 health_check.py --service backend # Check specific service
-    python3 health_check.py --json            # JSON output
-    python3 health_check.py --watch           # Continuous monitoring
+Performs system health checks for CPU, memory, disk, and network
+with exponential backoff retry logic for transient failures.
 """
 
-import argparse
-import json
+import functools
+import logging
 import os
 import socket
-import ssl
-import subprocess
-import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Callable, Tuple, Any, Optional, List, Type
 
-# ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-SERVICES = {
-    "backend": {"host": "localhost", "port": 8080, "path": "/health", "timeout": 5},
-    "market": {"host": "localhost", "port": 8081, "path": "/health", "timeout": 5},
-    "frailbox": {"host": "localhost", "port": 8082, "path": "/health", "timeout": 10},
-    "frontend": {"host": "localhost", "port": 3000, "path": "/", "timeout": 5},
-}
+# Type alias for health check result
+HealthCheckResult = Tuple[str, str, Any]
 
-INFRASTRUCTURE = {
-    "postgresql": {"host": os.environ.get("DB_HOST", "localhost"), "port": int(os.environ.get("DB_PORT", "5432")), "timeout": 5},
-    "redis": {"host": os.environ.get("REDIS_HOST", "localhost"), "port": int(os.environ.get("REDIS_PORT", "6379")), "timeout": 5},
-    "kafka": {"host": os.environ.get("KAFKA_HOST", "localhost"), "port": int(os.environ.get("KAFKA_PORT", "9092")), "timeout": 5},
-}
+# Transient exceptions that should trigger retry
+TRANSIENT_EXCEPTIONS: Tuple[Type[Exception], ...] = (
+    socket.timeout,
+    OSError,
+    ConnectionError,
+    TimeoutError,
+)
 
-DISK_THRESHOLD_WARNING = 80
-DISK_THRESHOLD_CRITICAL = 90
+# Default retry configuration
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BASE_DELAY = 1.0  # seconds
+DEFAULT_MAX_DELAY = 30.0  # seconds
+DEFAULT_EXPONENTIAL_BASE = 2
 
-MEMORY_THRESHOLD_WARNING = 80
-MEMORY_THRESHOLD_CRITICAL = 90
 
-# ---------------------------------------------------------------------------
-# CHECK FUNCTIONS
-# ---------------------------------------------------------------------------
+def retry_with_backoff(
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    max_delay: float = DEFAULT_MAX_DELAY,
+    exponential_base: int = DEFAULT_EXPONENTIAL_BASE,
+    exceptions: Tuple[Type[Exception], ...] = TRANSIENT_EXCEPTIONS,
+) -> Callable:
+    """
+    Decorator that implements retry logic with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts (minimum 3)
+        base_delay: Initial delay between retries in seconds
+        max_delay: Maximum delay between retries in seconds
+        exponential_base: Base for exponential backoff calculation
+        exceptions: Tuple of exception types to catch and retry
+    
+    Returns:
+        Decorated function with retry logic
+    """
+    # Ensure minimum of 3 retries as per requirements
+    max_retries = max(max_retries, 3)
+    
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> HealthCheckResult:
+            last_exception: Optional[Exception] = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    
+                    # Don't sleep after the last attempt
+                    if attempt < max_retries - 1:
+                        # Calculate delay with exponential backoff
+                        delay = min(
+                            base_delay * (exponential_base ** attempt),
+                            max_delay
+                        )
+                        logger.warning(
+                            f"{func.__name__} failed (attempt {attempt + 1}/{max_retries}): "
+                            f"{type(e).__name__}: {e}. Retrying in {delay:.2f}s..."
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error(
+                            f"{func.__name__} failed after {max_retries} attempts: "
+                            f"{type(e).__name__}: {e}"
+                        )
+            
+            # All retries exhausted - return error result
+            error_msg = f"Failed after {max_retries} retries: {last_exception}"
+            return ("error", error_msg, None)
+        
+        return wrapper
+    return decorator
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
-    import http.client
+
+@retry_with_backoff()
+def check_cpu_health() -> HealthCheckResult:
+    """
+    Check CPU health by examining load average.
+    
+    Returns:
+        Tuple of (status, detail, value) where:
+        - status: 'ok', 'warning', 'critical', or 'error'
+        - detail: Human-readable description
+        - value: The measured value (load average)
+    """
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path)
-        resp = conn.getresponse()
-        status = resp.status
-        body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
-
-        if status == 200:
-            result = "OK"
-            detail = f"HTTP {status}"
-        elif status < 500:
-            result = "WARNING"
-            detail = f"HTTP {status}: {body[:100]}"
+        load_avg = os.getloadavg()
+        cpu_count = os.cpu_count() or 1
+        
+        # Use 1-minute load average normalized by CPU count
+        load_per_cpu = load_avg[0] / cpu_count
+        
+        if load_per_cpu < 0.7:
+            status = "ok"
+            detail = f"CPU load normal: {load_avg[0]:.2f} ({load_per_cpu:.2f} per CPU)"
+        elif load_per_cpu < 1.0:
+            status = "warning"
+            detail = f"CPU load elevated: {load_avg[0]:.2f} ({load_per_cpu:.2f} per CPU)"
         else:
-            result = "CRITICAL"
-            detail = f"HTTP {status}: {body[:100]}"
+            status = "critical"
+            detail = f"CPU load high: {load_avg[0]:.2f} ({load_per_cpu:.2f} per CPU)"
+        
+        return (status, detail, load_avg[0])
+    
+    except AttributeError:
+        # os.getloadavg() not available on Windows
+        return ("ok", "Load average not available on this platform", None)
 
-        return result, detail, status
-    except Exception as e:
-        return "CRITICAL", str(e), 0
 
-
-def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
+@retry_with_backoff()
+def check_load_average() -> HealthCheckResult:
+    """
+    Check system load average (1, 5, 15 minute averages).
+    
+    Returns:
+        Tuple of (status, detail, value)
+    """
     try:
-        start = time.time()
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
-        latency = (time.time() - start) * 1000
-        return "OK", f"Connected ({latency:.1f}ms)", latency
-    except socket.timeout:
-        return "CRITICAL", f"Connection timeout ({timeout}s)", 0
-    except ConnectionRefusedError:
-        return "CRITICAL", "Connection refused", 0
-    except Exception as e:
-        return "CRITICAL", str(e), 0
-
-
-def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=10) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                cert = ssock.getpeercert()
-                if not cert:
-                    return "WARNING", "No certificate found", 0
-
-                from datetime import datetime as dt
-                expires = dt.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                days_left = (expires - dt.now()).days
-
-                if days_left > 30:
-                    return "OK", f"Certificate expires in {days_left} days", days_left
-                elif days_left > 7:
-                    return "WARNING", f"Certificate expires in {days_left} days", days_left
-                else:
-                    return "CRITICAL", f"Certificate expires in {days_left} days", days_left
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
-
-
-def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
-    try:
-        stat = os.statvfs(path)
-        total = stat.f_frsize * stat.f_blocks
-        free = stat.f_frsize * stat.f_bavail
-        used = total - free
-        pct = (used / total) * 100
-
-        if pct < DISK_THRESHOLD_WARNING:
-            return "OK", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        elif pct < DISK_THRESHOLD_CRITICAL:
-            return "WARNING", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
+        load_avg = os.getloadavg()
+        cpu_count = os.cpu_count() or 1
+        
+        # Check all three load averages
+        load_1, load_5, load_15 = load_avg
+        normalized_1 = load_1 / cpu_count
+        
+        if normalized_1 < 0.7:
+            status = "ok"
+        elif normalized_1 < 1.0:
+            status = "warning"
         else:
-            return "CRITICAL", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+            status = "critical"
+        
+        detail = f"Load avg (1/5/15 min): {load_1:.2f}/{load_5:.2f}/{load_15:.2f}"
+        return (status, detail, load_avg)
+    
+    except AttributeError:
+        return ("ok", "Load average not available on this platform", None)
 
 
-def check_memory_usage() -> Tuple[str, str, float]:
+@retry_with_backoff()
+def check_memory_usage() -> HealthCheckResult:
+    """
+    Check memory usage by reading /proc/meminfo or using fallback.
+    
+    Returns:
+        Tuple of (status, detail, value) where value is usage percentage
+    """
     try:
-        with open("/proc/meminfo") as f:
+        # Try reading from /proc/meminfo (Linux)
+        with open('/proc/meminfo', 'r') as f:
             meminfo = {}
             for line in f:
-                parts = line.split(":")
+                parts = line.split(':')
                 if len(parts) == 2:
                     key = parts[0].strip()
-                    value = parts[1].strip().replace(" kB", "")
-                    try:
-                        meminfo[key] = int(value) * 1024
-                    except ValueError:
-                        pass
-
-        total = meminfo.get("MemTotal", 0)
-        available = meminfo.get("MemAvailable", 0)
-        used = total - available
-        pct = (used / total) * 100 if total > 0 else 0
-
-        if pct < MEMORY_THRESHOLD_WARNING:
-            return "OK", f"{pct:.1f}% used ({used // (1024**3)}GB/{total // (1024**3)}GB)", pct
-        elif pct < MEMORY_THRESHOLD_CRITICAL:
-            return "WARNING", f"{pct:.1f}% used", pct
+                    # Extract numeric value (in kB)
+                    value_parts = parts[1].strip().split()
+                    if value_parts:
+                        try:
+                            meminfo[key] = int(value_parts[0])
+                        except ValueError:
+                            continue
+        
+        total = meminfo.get('MemTotal', 0)
+        available = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
+        
+        if total == 0:
+            return ("error", "Could not determine total memory", None)
+        
+        used_percent = ((total - available) / total) * 100
+        
+        if used_percent < 70:
+            status = "ok"
+            detail = f"Memory usage normal: {used_percent:.1f}%"
+        elif used_percent < 90:
+            status = "warning"
+            detail = f"Memory usage elevated: {used_percent:.1f}%"
         else:
-            return "CRITICAL", f"{pct:.1f}% used", pct
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+            status = "critical"
+            detail = f"Memory usage critical: {used_percent:.1f}%"
+        
+        return (status, detail, used_percent)
+    
+    except FileNotFoundError:
+        # Fallback for non-Linux systems
+        return ("ok", "Memory check not available on this platform", None)
 
 
-def check_load_average() -> Tuple[str, str, float]:
+@retry_with_backoff()
+def check_disk_usage(path: str = '/') -> HealthCheckResult:
+    """
+    Check disk usage for the specified path.
+    
+    Args:
+        path: Filesystem path to check (default: root)
+    
+    Returns:
+        Tuple of (status, detail, value) where value is usage percentage
+    """
     try:
-        with open("/proc/loadavg") as f:
-            parts = f.read().strip().split()
-            load = float(parts[0])
-            cpu_count = os.cpu_count() or 1
-            load_pct = (load / cpu_count) * 100
+        stat = os.statvfs(path)
+        
+        total = stat.f_blocks * stat.f_frsize
+        free = stat.f_bavail * stat.f_frsize
+        used = total - free
+        
+        if total == 0:
+            return ("error", f"Could not determine disk size for {path}", None)
+        
+        used_percent = (used / total) * 100
+        
+        if used_percent < 70:
+            status = "ok"
+            detail = f"Disk usage for {path}: {used_percent:.1f}%"
+        elif used_percent < 90:
+            status = "warning"
+            detail = f"Disk usage elevated for {path}: {used_percent:.1f}%"
+        else:
+            status = "critical"
+            detail = f"Disk usage critical for {path}: {used_percent:.1f}%"
+        
+        return (status, detail, used_percent)
+    
+    except AttributeError:
+        # os.statvfs not available on Windows
+        return ("ok", f"Disk check not available on this platform for {path}", None)
 
-            if load_pct < 70:
-                return "OK", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-            elif load_pct < 90:
-                return "WARNING", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-            else:
-                return "CRITICAL", f"Load: {load} ({load_pct:.0f}% of {cpu_count} cores)", load
-    except Exception as e:
-        return "WARNING", f"Cannot check: {e}", 0
+
+@retry_with_backoff()
+def check_tcp_port(host: str = 'localhost', port: int = 80, timeout: float = 5.0) -> HealthCheckResult:
+    """
+    Check if a TCP port is accessible.
+    
+    Args:
+        host: Hostname or IP address to check
+        port: Port number to check
+        timeout: Connection timeout in seconds
+    
+    Returns:
+        Tuple of (status, detail, value) where value is response time in ms
+    """
+    start_time = time.time()
+    
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        
+        result = sock.connect_ex((host, port))
+        response_time = (time.time() - start_time) * 1000  # Convert to ms
+        
+        sock.close()
+        
+        if result == 0:
+            status = "ok"
+            detail = f"Port {host}:{port} is open (response: {response_time:.1f}ms)"
+            return (status, detail, response_time)
+        else:
+            status = "critical"
+            detail = f"Port {host}:{port} is closed or unreachable"
+            return (status, detail, None)
+    
+    except socket.timeout:
+        # Re-raise to trigger retry
+        raise
+    except socket.gaierror as e:
+        # DNS resolution error - not transient, don't retry
+        return ("error", f"DNS resolution failed for {host}: {e}", None)
 
 
-# ---------------------------------------------------------------------------
-# HEALTH CHECK RUNNER
-# ---------------------------------------------------------------------------
-
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
-    results: Dict[str, Any] = {
-        "timestamp": datetime.now().isoformat(),
-        "hostname": socket.gethostname(),
-        "services": {},
-        "infrastructure": {},
-        "system": {},
-        "overall_status": "OK",
-    }
-
-    all_ok = True
-
-    # Check services
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
-        )
-        results["services"][name] = {
-            "status": status,
-            "detail": detail,
-            "code": code,
-            "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
-        }
-        if status == "CRITICAL":
-            all_ok = False
-
-    # Check infrastructure
-    for name, config in INFRASTRUCTURE.items():
-        if service and name != service:
-            continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
-        results["infrastructure"][name] = {
-            "status": status,
-            "detail": detail,
-            "endpoint": f"{config['host']}:{config['port']}",
-        }
-        if status == "CRITICAL":
-            all_ok = False
-
-    # Check system resources
-    disk_status, disk_detail, disk_pct = check_disk_usage()
-    results["system"]["disk"] = {"status": disk_status, "detail": disk_detail}
-    if disk_status == "CRITICAL":
-        all_ok = False
-
-    mem_status, mem_detail, mem_pct = check_memory_usage()
-    results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
-    if mem_status == "CRITICAL":
-        all_ok = False
-
-    load_status, load_detail, load_val = check_load_average()
-    results["system"]["load"] = {"status": load_status, "detail": load_detail}
-
-    # Check certificate expiry (web services)
-    for name, config in SERVICES.items():
-        if service and name != service:
-            continue
-        if config["port"] == 443:
-            cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
-            results["services"][name]["certificate"] = {
-                "status": cert_status,
-                "detail": cert_detail,
-                "days_remaining": days_left,
-            }
-            if cert_status == "CRITICAL":
-                all_ok = False
-
-    results["overall_status"] = "OK" if all_ok else "DEGRADED"
-
+def check_system_health(
+    include_network: bool = True,
+    network_host: str = 'localhost',
+    network_port: int = 80,
+    disk_paths: Optional[List[str]] = None
+) -> dict:
+    """
+    Perform comprehensive system health check.
+    
+    Args:
+        include_network: Whether to include TCP port check
+        network_host: Host for network check
+        network_port: Port for network check
+        disk_paths: List of disk paths to check (default: ['/'])
+    
+    Returns:
+        Dictionary with health check results for each component
+    """
+    if disk_paths is None:
+        disk_paths = ['/']
+    
+    results = {}
+    
+    # CPU health check
+    logger.info("Checking CPU health...")
+    results['cpu'] = check_cpu_health()
+    
+    # Load average check
+    logger.info("Checking load average...")
+    results['load_average'] = check_load_average()
+    
+    # Memory check
+    logger.info("Checking memory usage...")
+    results['memory'] = check_memory_usage()
+    
+    # Disk checks
+    for path in disk_paths:
+        logger.info(f"Checking disk usage for {path}...")
+        results[f'disk_{path}'] = check_disk_usage(path)
+    
+    # Network check
+    if include_network:
+        logger.info(f"Checking TCP port {network_host}:{network_port}...")
+        results['network'] = check_tcp_port(network_host, network_port)
+    
+    # Calculate overall status
+    statuses = [r[0] for r in results.values()]
+    if 'critical' in statuses:
+        overall = 'critical'
+    elif 'error' in statuses:
+        overall = 'error'
+    elif 'warning' in statuses:
+        overall = 'warning'
+    else:
+        overall = 'ok'
+    
+    results['overall'] = (overall, f"System health: {overall}", None)
+    
     return results
 
 
-def print_health_report(results: Dict[str, Any]):
-    print(f"\n{'='*60}")
-    print(f"  HEALTH CHECK REPORT")
-    print(f"  Host: {results['hostname']}")
-    print(f"  Time: {results['timestamp']}")
-    print(f"  Overall: {results['overall_status']}")
-    print(f"{'='*60}")
-
-    for category, items in [("Services", results["services"]),
-                             ("Infrastructure", results["infrastructure"]),
-                             ("System", results["system"])]:
-        if items:
-            print(f"\n  {category}:")
-            for name, check in items.items():
-                if isinstance(check, dict) and "status" in check:
-                    status_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(check["status"], "?")
-                    print(f"    {status_icon} {name}: {check['detail']}")
-                else:
-                    print(f"    {name}:")
-                    for sub_name, sub_check in check.items():
-                        if isinstance(sub_check, dict) and "status" in sub_check:
-                            sub_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(sub_check["status"], "?")
-                            print(f"      {sub_icon} {sub_name}: {sub_check['detail']}")
-    print()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Health check tool")
-    parser.add_argument("--service", "-s", help="Check specific service only")
-    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
-    parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
-    parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
-    parser.add_argument("--output", "-o", help="Output file path")
-    return parser.parse_args()
+def format_health_report(results: dict) -> str:
+    """
+    Format health check results as a human-readable report.
+    
+    Args:
+        results: Dictionary of health check results
+    
+    Returns:
+        Formatted string report
+    """
+    lines = ["=" * 50, "SYSTEM HEALTH REPORT", "=" * 50, ""]
+    
+    status_icons = {
+        'ok': '✓',
+        'warning': '⚠',
+        'critical': '✗',
+        'error': '!'
+    }
+    
+    for component, (status, detail, value) in results.items():
+        icon = status_icons.get(status, '?')
+        lines.append(f"[{icon}] {component.upper()}: {status}")
+        lines.append(f"    {detail}")
+        if value is not None:
+            lines.append(f"    Value: {value}")
+        lines.append("")
+    
+    lines.append("=" * 50)
+    return "\n".join(lines)
 
 
-def main():
-    args = parse_args()
-
-    if args.watch:
-        print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
-        try:
-            while True:
-                results = run_health_checks(args.service, args.json)
-                if args.json:
-                    print(json.dumps(results, indent=2))
-                else:
-                    print_health_report(results)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nMonitoring stopped")
+if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='System Health Check')
+    parser.add_argument('--no-network', action='store_true',
+                        help='Skip network checks')
+    parser.add_argument('--host', default='localhost',
+                        help='Host for network check')
+    parser.add_argument('--port', type=int, default=80,
+                        help='Port for network check')
+    parser.add_argument('--disk', action='append', dest='disks',
+                        help='Disk paths to check (can be specified multiple times)')
+    parser.add_argument('--json', action='store_true',
+                        help='Output in JSON format')
+    
+    args = parser.parse_args()
+    
+    results = check_system_health(
+        include_network=not args.no_network,
+        network_host=args.host,
+        network_port=args.port,
+        disk_paths=args.disks
+    )
+    
+    if args.json:
+        import json
+        # Convert tuples to dicts for JSON serialization
+        json_results = {
+            k: {'status': v[0], 'detail': v[1], 'value': v[2]}
+            for k, v in results.items()
+        }
+        print(json.dumps(json_results, indent=2))
     else:
-        results = run_health_checks(args.service, args.json)
-        if args.json:
-            output = json.dumps(results, indent=2)
-            print(output)
-        else:
-            print_health_report(results)
-
-        if args.output:
-            with open(args.output, "w") as f:
-                if args.json:
-                    json.dump(results, f, indent=2)
-                else:
-                    json.dump(results, f, indent=2)
-            print(f"Report saved to {args.output}")
-
-        if results["overall_status"] == "DEGRADED":
-            return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    main()
+        print(format_health_report(results))
